@@ -81,7 +81,7 @@ or via docker compose.
 ```yaml
 services:
   unifi-nvr-api-motion-mqtt-gifs:
-    image: fabtesta/unifi-nvr-api-motion-mqtt-gifss:latest
+    image: fabtesta/unifi-nvr-api-motion-mqtt-gifs:latest
     volumes:
       - ./config:/config
       - ./gifs:/gifs
