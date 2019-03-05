@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-
+import datetime
 import json
-import requests
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
-from collections import deque
 from pathlib import Path
+from sqlite3 import Error
 
 import paho.mqtt.client as mqtt
+import requests
 from requests import HTTPError
 
 logging.basicConfig(level=logging.DEBUG,
@@ -25,11 +26,66 @@ unifiApiCameraInfoUrl = "{}/api/2.0/camera/{}"
 unifiApiRecordingInfoUrl = "{}/api/2.0/recording/{}"
 unifiApiRecordingDownloadUrl = "{}/api/2.0/recording/{}/download"
 
+sql_create_processed_events_table = """ CREATE TABLE IF NOT EXISTS processed_events (
+                                        id integer PRIMARY KEY,
+                                        camera_id text NOT NULL,
+                                        last_event_id text NOT NULL,
+                                        last_recording_start_time int NOT NULL,
+                                        processed_date timestamp NOT NULL
+                                    ); """
+
+sql_create_processed_events_table_unique = """ CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_camera ON processed_events (camera_id); """
+
 
 def parse_config(config_path):
     with open(config_path, 'r') as config_file:
         config_data = json.load(config_file)
     return config_data
+
+
+def create_connection(data_folder):
+    try:
+        conn = sqlite3.connect(data_folder + '/processed_events.db')
+        print(sqlite3.version)
+        return conn
+    except Error as e:
+        logging.error("CANNOT CREATE DB", e)
+
+    return None
+
+
+def create_processed_events_table(conn):
+    try:
+        c = conn.cursor()
+        c.execute(sql_create_processed_events_table)
+        c.execute(sql_create_processed_events_table_unique)
+    except Error as e:
+        logging.error("CANNOT CREATE TABLE", e)
+
+
+def check_already_processed_event_by_camera(conn, camera_id, event_id, last_recording_start_time):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM processed_events WHERE camera_id=? AND last_recording_start_time>=?",
+                (camera_id, last_recording_start_time))
+
+    rows = cur.fetchall()
+
+    already_processed = False
+    for row in rows:
+        logging.error("Event %s already processed %s", event_id, row)
+        already_processed = True
+
+    return already_processed
+
+
+def replace_processed_events(conn, processed_event):
+    sql = ''' REPLACE INTO processed_events(camera_id, last_event_id, last_recording_start_time, processed_date)
+              VALUES(?,?,?,?) '''
+    cur = conn.cursor()
+    cur.execute(sql, processed_event)
+
+    conn.commit()
+    return cur.lastrowid
 
 
 def unifi_login(base_url, user, password):
@@ -41,7 +97,8 @@ def unifi_login(base_url, user, password):
     if login_response.ok:
         login_data = json.loads(login_response.content.decode('utf-8'))
         if login_data["data"]:
-            logging.info('login_response got JSESSIONID_AV for username %s', login_data["data"][0]["account"]["username"])
+            logging.info('login_response got JSESSIONID_AV for username %s',
+                         login_data["data"][0]["account"]["username"])
             return session
         else:
             return None
@@ -148,7 +205,7 @@ def convert_video_gif(scale, skip_first_n_secs, max_length_secs, input_video, ou
 
 
 class CameraMotionEventHandler:
-    def __init__(self, processed_events, base_url, camera, config, session):
+    def __init__(self, processed_events_conn, base_url, camera, config, session):
         self.base_url = base_url
         self.camera = camera
         self.config = config
@@ -157,7 +214,7 @@ class CameraMotionEventHandler:
         self.mqtt_client.username_pw_set(username=self.config["mqtt_user"], password=self.config["mqtt_pwd"])
         # Keep a FIFO of files processed so we can guard against duplicate
         # events
-        self.processed_events = processed_events
+        self.processed_events_conn = processed_events_conn
 
     def publish_event(self, event):
         event_file = Path(event.mp4_path)
@@ -180,7 +237,9 @@ class CameraMotionEventHandler:
         logging.info('Start getting last camera event for camera %s %s', self.camera["_id"], self.camera["topic_name"])
         camera_info = unifi_camera_info(self.base_url, self.camera["_id"], self.session)
         if camera_info:
-            if camera_info["lastRecordingId"] in self.processed_events:
+            if check_already_processed_event_by_camera(self.processed_events_conn, self.camera["_id"],
+                                                       camera_info["lastRecordingId"],
+                                                       camera_info["lastRecordingStartTime"]):
                 logging.info('Recording %s already processed', camera_info["lastRecordingId"])
                 return None, None
 
@@ -191,7 +250,8 @@ class CameraMotionEventHandler:
                     logging.info('Recording %s is in progress skip for now', camera_info["lastRecordingId"])
                     return None, None
             else:
-                logging.info('No recording info found for recording_id %s for camera %s %s', camera_info["lastRecordingId"]
+                logging.info('No recording info found for recording_id %s for camera %s %s',
+                             camera_info["lastRecordingId"]
                              , self.camera["_id"], self.camera["topic_name"])
                 return None, None
 
@@ -207,7 +267,10 @@ class CameraMotionEventHandler:
             if convert_retcode == 0:
                 public_retcode = self.publish_mqtt_message('{}.gif'.format(camera_info["lastRecordingId"]))
                 if public_retcode:
-                    self.processed_events.append(camera_info["lastRecordingId"])
+                    processed_event = (
+                        self.camera["_id"], camera_info["lastRecordingId"], camera_info["lastRecordingStartTime"],
+                        datetime.datetime.now())
+                    replace_processed_events(self.processed_events_conn, processed_event)
                     logging.info('Done processing recording_id %s', camera_info["lastRecordingId"])
                 else:
                     logging.error('Invalid return code from mqtt publish for recording_id %s camera topic %s',
@@ -226,7 +289,21 @@ def main():
     logging.info('Parsing %s', config_filename)
     config = parse_config(config_filename)
 
-    processed_events = deque(maxlen=100)
+    config_data_folder = ''
+    if 'data_folder' in config:
+        config_data_folder = config["data_folder"]
+    if config_data_folder == '':
+        config_data_folder = "/data"
+
+    logging.info('Creating/Opening processed_events database on file %s', config_data_folder)
+    processed_events_conn = create_connection(config_data_folder)
+    if processed_events_conn is not None:
+        # create processed_events table
+        create_processed_events_table(processed_events_conn)
+    else:
+        logging.error('Error! cannot create the database connection.')
+        return
+
     session = None
     logged_in = False
     running = True
@@ -257,7 +334,8 @@ def main():
 
             for camera in config["unifi_cameras"]:
                 logging.info('CameraMotionEventHandler poll_recording %s %s', camera["_id"], camera["topic_name"])
-                camera_handler = CameraMotionEventHandler(processed_events, config["unifi_video_base_api_url"], camera,
+                camera_handler = CameraMotionEventHandler(processed_events_conn, config["unifi_video_base_api_url"],
+                                                          camera,
                                                           config, session)
                 camera_handler.poll_recording()
 
