@@ -6,6 +6,9 @@ Supports [undocumented UniFI Video NVR API](https://dl.ubnt.com/guides/unifivide
 Supports multiple cameras polling and ffmpeg parameters
 Remembers already processed events across restarts.
 
+## This docker image has almost 10k downloads on Docker Hub!
+<a href="https://www.buymeacoffee.com/fabtesta" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/lato-yellow_img.png" alt="Buy Me A Coffee" style="height: 51px !important;width: 217px !important;" ></a>
+
 ## Config File
 
 Needs a simple JSON based config file passed in on the command line.
